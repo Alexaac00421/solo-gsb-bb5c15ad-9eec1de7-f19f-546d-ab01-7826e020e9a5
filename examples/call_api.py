@@ -15,7 +15,9 @@
    同类型重复受理/非 filable 拒绝/凭证查询）；
 9. 节假日表工作日诊断：只读逐日列出工作/休息判定与截止时刻（含非法参数拒绝）；
 10. 跨订单理赔待办快照：首请求按核对时刻冻结完整结果并分页返回，
-    游标翻页（30 分钟过期），含非法参数/无效游标拒绝示例。
+    游标翻页（30 分钟过期），含非法参数/无效游标拒绝示例；
+11. 已受理理赔复核（只读）：按凭证编号 + 带偏移核对时刻对比受理时/基线/现时
+    三视图，区分时间推移与后到事件的影响（含非法参数拒绝）。
 """
 import json
 import os
@@ -147,8 +149,109 @@ def main():
     claim_demo()
     calendar_diagnose_demo()
     todo_snapshot_demo()
+    claim_review_demo()
 
     print("\n示例完成。交互文档：" + BASE + "/docs")
+
+
+def claim_review_demo():
+    """已受理理赔复核（只读）：按凭证编号 + 核对时刻对比受理时/基线/现时判定。"""
+    print("\n\n########## 已受理理赔复核演示 ##########")
+    oid = "DEMO-REVIEW-20250205-001"
+    r = call("POST", "/api/v1/orders", {
+        "order_id": oid,
+        "created_at": "2025-02-05T09:00:00+08:00",
+        "timezone": "Asia/Shanghai",
+        "calendar_code": "CN",
+        "promise_by": "2025-02-10T18:00:00+08:00",
+        "weight_kg": 2.5,
+    })
+    if r is None:
+        print("复核演示订单创建失败（可能已存在于持久化数据中），跳过本段演示")
+        return
+    call("POST", f"/api/v1/orders/{oid}/events", {
+        "event_id": "EV-REV-SIGNED-01",
+        "event_type": "signed",
+        "event_time": "2025-02-11T10:00:00+08:00",   # 迟到签收
+        "arrived_at": "2025-02-11T10:05:00+08:00",
+    })
+    v = call("POST", f"/api/v1/orders/{oid}/claims", {
+        "claim_type": "delay",
+        "idempotency_key": "IDEMP-REVIEW-001",
+        "received_at": "2025-02-20T12:00:00+08:00",   # 服务接收申请时刻
+    })
+    if v is None:
+        return
+    claim_no = v["claim_no"]
+    print(f"已受理凭证 {claim_no}（接收时刻 {v['received_at_utc']}，"
+          f"截止 {v['deadline_local']}）")
+
+    # 受理后到达的迟到更正：签收修正为 2/9（未迟到）
+    call("POST", f"/api/v1/orders/{oid}/events", {
+        "event_id": "EV-REV-CORR-01",
+        "event_type": "signed",
+        "event_time": "2025-02-09T09:00:00+08:00",
+        "arrived_at": "2025-02-21T08:00:00+08:00",    # 晚于凭证接收时刻 -> 后到事件
+        "correction_action": "amend",
+        "target_event_id": "EV-REV-SIGNED-01",
+        "note": "网点补传准确签收时间",
+    })
+
+    # 复核：核对时刻 2/22（须带时区偏移，且不晚于服务当前时刻）
+    rv = call("GET", f"/api/v1/claims/{claim_no}/review",
+              params={"as_of": "2025-02-22T12:00:00+08:00"})
+    print("\n--- 1) 复核三视图（受理时 / 基线 / 现时） ---")
+    if rv:
+        for key in ("accepted", "baseline", "current"):
+            d = rv["determinations"][key]
+            print(f"  {d['label']}: status={d['status']} "
+                  f"deadline={d['deadline_local']}（事件截止 {d['events_cutoff_utc']}）")
+        tp = rv["time_passage"]
+        print(f"  时间推移：changed={tp['changed']} "
+              f"{tp['status_before']} -> {tp['status_after']} | {tp['note']}")
+        le = rv["late_events"]
+        print(f"  后到事件：changed={le['changed']} "
+              f"{le['status_before']} -> {le['status_after']} | {le['note']}")
+        for e in le["events"]:
+            print(f"    纳入现时重算：{e['event_id']} "
+                  f"更正动作={e['correction_action']} 目标={e['target_event_id']}")
+
+    # 自然过期归因：另一订单受理后无任何事件，核对时刻已过截止
+    oid2 = oid + "-EXP"
+    call("POST", "/api/v1/orders", {
+        "order_id": oid2,
+        "created_at": "2025-02-05T09:00:00+08:00",
+        "timezone": "Asia/Shanghai", "calendar_code": "CN",
+        "promise_by": "2025-02-10T18:00:00+08:00"})
+    call("POST", f"/api/v1/orders/{oid2}/events", {
+        "event_id": "EV-REV-EXP-SIGNED",
+        "event_type": "signed",
+        "event_time": "2025-02-11T10:00:00+08:00",
+        "arrived_at": "2025-02-11T10:05:00+08:00"})
+    v2 = call("POST", f"/api/v1/orders/{oid2}/claims", {
+        "claim_type": "delay", "idempotency_key": "IDEMP-REVIEW-EXP",
+        "received_at": "2025-02-20T12:00:00+08:00"})
+    if v2:
+        rv2 = call("GET", f"/api/v1/claims/{v2['claim_no']}/review",
+                   params={"as_of": "2025-02-26T08:00:00+08:00"})  # 截止 2/25 已过
+        print("\n--- 2) 自然过期归因（时间推移，而非更正） ---")
+        if rv2:
+            det = rv2["determinations"]
+            print(f"  受理时={det['accepted']['status']} -> "
+                  f"基线={det['baseline']['status']} -> 现时={det['current']['status']}")
+            print(f"  时间推移：{rv2['time_passage']['note']}")
+            print(f"  后到事件：{rv2['late_events']['note']}")
+
+    # 非法参数示例：缺偏移 / 未来时刻 / 早于接收时刻 / 凭证不存在，均被明确拒绝
+    print("\n--- 3) 非法参数拒绝示例 ---")
+    call("GET", f"/api/v1/claims/{claim_no}/review",
+         params={"as_of": "2025-02-22T12:00:00"})                 # 缺偏移 -> 422
+    call("GET", f"/api/v1/claims/{claim_no}/review",
+         params={"as_of": "2999-01-01T00:00:00+08:00"})           # 未来时刻 -> 422
+    call("GET", f"/api/v1/claims/{claim_no}/review",
+         params={"as_of": "2025-02-19T12:00:00+08:00"})           # 早于接收 -> 422
+    call("GET", "/api/v1/claims/CLM-NOPE/review",
+         params={"as_of": "2025-02-22T12:00:00+08:00"})           # 凭证不存在 -> 404
 
 
 def todo_snapshot_demo():
