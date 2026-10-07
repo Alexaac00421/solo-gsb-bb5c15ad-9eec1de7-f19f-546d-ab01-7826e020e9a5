@@ -1002,3 +1002,323 @@ def get_todo_snapshot_page(cursor: str) -> dict:
              "page": page, "page_count": pages},
         )
     return _snapshot_page_payload(row, page)
+
+
+# ---------------------------------------------------------------- 已受理理赔复核（只读）
+
+REVIEW_READ_ONLY_NOTE = (
+    "只读复核：未修改凭证、事件、判定代、归档快照或既有受理规则；"
+    "受理时判定取自凭证冻结快照，基线与现时判定均按订单锁定的政策版本、"
+    "订单时区与节假日表重新计算，归档快照不替代重算"
+)
+
+
+def _parse_review_as_of(as_of: str | None) -> datetime:
+    """复核核对时刻：必填、必须是带时区偏移的 ISO8601，统一转 UTC。"""
+    if not as_of:
+        raise AppError(
+            "INVALID_REQUEST",
+            "核对时刻 as_of 必填，须为带时区偏移的 ISO8601 时间，"
+            "如 2025-02-26T12:00:00+08:00",
+            422,
+            {"field": "as_of"},
+        )
+    try:
+        return parse_dt(as_of)
+    except Exception:
+        raise AppError(
+            "INVALID_REQUEST",
+            "核对时刻 as_of 必须是带时区偏移的 ISO8601 时间"
+            "（naive 时间一律拒绝）",
+            422,
+            {"field": "as_of", "value": as_of},
+        )
+
+
+def _gen_at_time(conn, order_id: str, point_utc: datetime):
+    """截至 point 时刻已开启的最新一代（gen.opened_at <= point）。"""
+    return conn.execute(
+        "SELECT * FROM generations WHERE order_id = ? AND opened_at <= ? "
+        "ORDER BY gen_no DESC LIMIT 1",
+        (order_id, point_utc.isoformat()),
+    ).fetchone()
+
+
+def _claim_of(determination: dict, claim_type: str) -> dict:
+    return next(c for c in determination["claims"]
+                if c["claim_type"] == claim_type)
+
+
+def _decision_code(status: str) -> str:
+    return status.upper()
+
+
+def _review_view(claim: dict, determination: dict, *, label: str, recomputed: bool,
+                 event_cutoff_utc: datetime, event_count: int, source: str) -> dict:
+    return {
+        "label": label,
+        "source": source,
+        "recomputed": recomputed,
+        "event_view": {
+            "arrived_no_later_than_utc": event_cutoff_utc.isoformat(),
+            "event_count": event_count,
+            "generation_no": determination["generation_no"],
+        },
+        "status": claim["status"],
+        "decision_code": _decision_code(claim["status"]),
+        "deadline_local": claim["deadline_local"],
+        "deadline_utc": claim["deadline_utc"],
+        "missing_evidence": claim["missing_evidence"],
+        "claim": claim,
+        "determination": determination,
+    }
+
+
+def _status_deadline_change(before: dict, after: dict) -> dict:
+    return {
+        "status_before": before["status"],
+        "status_after": after["status"],
+        "status_changed": before["status"] != after["status"],
+        "deadline_utc_before": before["deadline_utc"],
+        "deadline_utc_after": after["deadline_utc"],
+        "deadline_changed": before["deadline_utc"] != after["deadline_utc"],
+    }
+
+
+def _late_event_item(r, label_map) -> dict:
+    is_corr = bool(r["is_correction"])
+    action = r["correction_action"] if is_corr else "scan"
+    if is_corr:
+        action_label = {
+            C.AMEND: "更正动作 amend：修正目标基础事件的发生时间",
+            C.CANCEL: "更正动作 cancel：撤销目标基础事件",
+            C.INSERT: "更正动作 insert：补录一条此前漏掉的扫描",
+        }[r["correction_action"]]
+    else:
+        action_label = "普通扫描事件（非更正）"
+    return {
+        "event_id": r["event_id"],
+        "event_type": r["event_type"],
+        "event_name": label_map.get(r["event_type"], r["event_type"]),
+        "event_time_utc": r["event_time"],
+        "arrived_at_utc": r["arrived_at"],
+        "generation_no": r["gen_no"],
+        "is_correction": is_corr,
+        "correction_action": r["correction_action"],
+        "action": action,
+        "action_label": action_label,
+        "target_event_id": r["target_event_id"],
+        "note": r["note"] or "",
+    }
+
+
+def review_accepted_claim(claim_no: str, as_of: str | None) -> dict:
+    """运营复核：按凭证编号 + 带时区偏移的核对时刻查询资格变化（全程只读）。
+
+    三份判定均使用订单锁定的政策版本、订单时区与节假日表：
+    - accepted_at_review：凭证冻结的**受理时判定**（取自不可变凭证快照，不重算）；
+    - baseline_at_review：事件视图冻结在受理接收时刻（接收后到达的事件一律不纳入），
+      仅把判定时刻推进到核对时刻——隔离"时间推移"的单独效应；
+    - current_at_review：纳入所有不晚于核对时刻到达的扫描与更正后**现时重算**，
+      归档快照不替代重算——隔离"后到事件"在时间推移之上的追加效应。
+
+    明确拒绝：核对时刻缺失/无偏移（422 INVALID_REQUEST）、早于凭证接收时刻
+    （422 REVIEW_TIME_BEFORE_RECEIVED）、晚于服务当前时刻
+    （422 REVIEW_TIME_IN_FUTURE）、凭证不存在（404 VOUCHER_NOT_FOUND）。
+    """
+    review_utc = _parse_review_as_of(as_of)
+
+    row = q1("SELECT * FROM claim_vouchers WHERE claim_no = ?", (claim_no,))
+    if row is None:
+        raise AppError("VOUCHER_NOT_FOUND", f"凭证不存在: {claim_no}", 404)
+
+    received_utc = parse_dt(row["received_at"])
+    if review_utc < received_utc:
+        raise AppError(
+            "REVIEW_TIME_BEFORE_RECEIVED",
+            f"核对时刻 {review_utc.isoformat()} 早于凭证接收时刻 "
+            f"{received_utc.isoformat()}：受理尚未发生，不能复核",
+            422,
+            {"claim_no": claim_no,
+             "review_at_utc": review_utc.isoformat(),
+             "received_at_utc": received_utc.isoformat()},
+        )
+    served_utc = utc_now()
+    if review_utc > served_utc:
+        raise AppError(
+            "REVIEW_TIME_IN_FUTURE",
+            f"核对时刻 {review_utc.isoformat()} 晚于服务当前时刻 "
+            f"{served_utc.isoformat()}：不能按未来时刻复核",
+            422,
+            {"claim_no": claim_no,
+             "review_at_utc": review_utc.isoformat(),
+             "served_at_utc": served_utc.isoformat()},
+        )
+
+    order = require_order(row["order_id"])
+    policy = load_policy(order["created_policy"])
+    claim_type = row["claim_type"]
+
+    frozen_claim = json.loads(row["claim_json"])
+    frozen_det = json.loads(row["determination_json"])
+
+    with db.tx() as conn:
+        all_rows = conn.execute(
+            """SELECT e.*, g.gen_no FROM events e
+               JOIN generations g ON e.gen_id = g.id
+               WHERE e.order_id = ? ORDER BY e.arrived_at""",
+            (order["order_id"],),
+        ).fetchall()
+        gen_at_received = _gen_at_time(conn, order["order_id"], received_utc)
+        gen_at_review = _gen_at_time(conn, order["order_id"], review_utc)
+
+    events = [dict(r) for r in all_rows]
+    received_rows = [e for e in events if parse_dt(e["arrived_at"]) <= received_utc]
+    review_rows = [e for e in events if parse_dt(e["arrived_at"]) <= review_utc]
+    late_rows = [e for e in review_rows if parse_dt(e["arrived_at"]) > received_utc]
+
+    # --- 基线判定：同一事件视图（受理接收时刻截止），仅推进判定时刻 ---
+    baseline_gen_info = {"gen_no": gen_at_received["gen_no"],
+                         "supersedes_gen": gen_at_received["supersedes_gen"]}
+    baseline_det = evaluate(order, received_rows, policy, as_of=review_utc,
+                            generation_info=baseline_gen_info)
+    baseline_det["basis"].append(
+        f"受理复核·基线判定：事件视图冻结为不晚于凭证接收时刻 "
+        f"{to_local(received_utc, order['timezone']).isoformat()} 到达的事件，"
+        f"受理后到达的事件一律不纳入；仅将判定时刻推进到核对时刻 "
+        f"{to_local(review_utc, order['timezone']).isoformat()}；"
+        "按订单锁定政策、时区与节假日表重算，未读取任何归档快照"
+    )
+    baseline_claim = _claim_of(baseline_det, claim_type)
+
+    # --- 现时判定：纳入截至核对时刻到达的全部扫描与更正 ---
+    current_gen_info = {"gen_no": gen_at_review["gen_no"],
+                        "supersedes_gen": gen_at_review["supersedes_gen"]}
+    current_det = evaluate(order, review_rows, policy, as_of=review_utc,
+                           generation_info=current_gen_info)
+    late_corrections = [e for e in late_rows if e["is_correction"]]
+    current_det["basis"].append(
+        f"受理复核·现时判定：已纳入截至核对时刻 "
+        f"{to_local(review_utc, order['timezone']).isoformat()} 到达的全部事件"
+        f"（其中受理后到达 {len(late_rows)} 条，含更正 {len(late_corrections)} 条）；"
+        "按订单锁定政策、时区与节假日表重算，归档快照不替代重算"
+    )
+    current_claim = _claim_of(current_det, claim_type)
+
+    # --- 受理时判定（凭证冻结，不重算） ---
+    accepted_view = {
+        "label": "受理时判定（凭证冻结）",
+        "source": "voucher_frozen_snapshot",
+        "recomputed": False,
+        "event_view": {
+            "arrived_no_later_than_utc": received_utc.isoformat(),
+            "event_count": len(received_rows),
+            "generation_no": frozen_det.get("generation_no"),
+        },
+        "status": "filable",            # 凭证只可能在 filable 时受理
+        "decision_code": row["decision_code"],
+        "deadline_local": frozen_claim.get("deadline_local"),
+        "deadline_utc": frozen_claim.get("deadline_utc"),
+        "missing_evidence": frozen_claim.get("missing_evidence", []),
+        "claim": frozen_claim,
+        "determination": frozen_det,
+    }
+    baseline_view = _review_view(
+        baseline_claim, baseline_det, label="基线判定（事件冻结在接收时刻，仅推进时间）",
+        recomputed=True, event_cutoff_utc=received_utc, event_count=len(received_rows),
+        source="recomputed_with_events_arrived_by_received_at")
+    current_view = _review_view(
+        current_claim, current_det, label="现时判定（纳入截至核对时刻到达的扫描与更正）",
+        recomputed=True, event_cutoff_utc=review_utc, event_count=len(review_rows),
+        source="recomputed_with_events_arrived_by_review_at")
+
+    # --- 归因之一：仅时间推移（受理冻结 -> 基线） ---
+    tp = _status_deadline_change(frozen_claim, baseline_claim)
+    tp_natural_expiry = (
+        tp["status_changed"] and baseline_claim["status"] == "not_filable"
+        and not tp["deadline_changed"]
+    )
+    if tp_natural_expiry:
+        tp_attribution = (
+            f"仅时间推移即改变该类型状态：filable → not_filable；截止时刻 "
+            f"{baseline_claim['deadline_local']} 在核对时刻前自然到期，"
+            "属自然过期，与受理后到达事件及更正无关"
+        )
+    elif tp["status_changed"] or tp["deadline_changed"]:
+        tp_attribution = "仅推进判定时刻即引起状态或截止时刻变化（详见前后值）"
+    else:
+        tp_attribution = "仅推进判定时刻未纳入任何后到事件：该类型状态与截止时刻均未改变"
+    tp.update({
+        "overall_status_before": frozen_det.get("overall_status"),
+        "overall_status_after": baseline_det["overall_status"],
+        "natural_expiry": tp_natural_expiry,
+        "attributed_to_correction": False,
+        "attribution": tp_attribution,
+    })
+
+    # --- 归因之二：后到事件（基线 -> 现时；同一核对时刻） ---
+    la = _status_deadline_change(baseline_claim, current_claim)
+    baseline_expired = baseline_claim["status"] == "not_filable"
+    late_events = [_late_event_item(e, C.EVENT_LABELS) for e in late_rows]
+    late_ids = [e["event_id"] for e in late_rows]
+    correction_items = [x for x in late_events if x["is_correction"]]
+    la_driven = la["status_changed"] or la["deadline_changed"]
+    la.update({
+        "overall_status_before": baseline_det["overall_status"],
+        "overall_status_after": current_det["overall_status"],
+        "included_late_event_ids": late_ids,
+        "included_late_correction_ids": [x["event_id"] for x in correction_items],
+        "late_events_count": len(late_events),
+        "late_corrections_count": len(correction_items),
+        "late_scans_count": len(late_events) - len(correction_items),
+        "baseline_already_expired": baseline_expired,
+        "driven_by_late_events": la_driven,
+    })
+    if baseline_expired and not la_driven:
+        la_attribution = (
+            f"基线下该类型已随截止时刻 {baseline_claim['deadline_local']} 自然过期；"
+            "受理后到达的事件/更正未改变该过期状态，自然过期不归因于任何更正"
+        )
+    elif baseline_expired and la_driven:
+        la_attribution = (
+            "基线已自然过期；后到事件另引起状态或截止时刻变化（见前后值），"
+            "其中自然过期部分仍不归因于更正，变化由后到事件单独造成"
+        )
+    elif la_driven:
+        la_attribution = (
+            "状态或截止时刻的变化由受理后到达事件造成（事件编号与更正动作见 "
+            "included_late_event_ids / late_events），非时间推移所致"
+        )
+    else:
+        la_attribution = "受理后到达的扫描与更正未改变该类型状态或截止时刻"
+    la["attributed_to_correction"] = la_driven and any(
+        x["is_correction"] for x in correction_items)
+    la["attribution"] = la_attribution
+
+    return {
+        "claim_no": claim_no,
+        "order_id": order["order_id"],
+        "claim_type": claim_type,
+        "claim_name": C.CLAIM_LABELS[claim_type],
+        "received_at_utc": received_utc.isoformat(),
+        "review_at_utc": review_utc.isoformat(),
+        "served_at_utc": served_utc.isoformat(),
+        "policy_version": order["created_policy"],
+        "timezone": order["timezone"],
+        "calendar_code": order["calendar_code"],
+        "locked_policy_basis": (
+            f"订单 {order['order_id']} 于 {order['created_at']} 创建时锁定政策 "
+            f"{order['created_policy']}，三份判定均按该政策、订单时区 "
+            f"{order['timezone']} 与节假日表 {order['calendar_code']} 计算"
+        ),
+        "accepted_archived_generation_rechecked":
+            frozen_det.get("archived_generation_rechecked", False),
+        "accepted_at_review": accepted_view,
+        "baseline_at_review": baseline_view,
+        "current_at_review": current_view,
+        "time_passage": tp,
+        "late_arrivals": la,
+        "late_events": late_events,
+        "read_only": True,
+        "note": REVIEW_READ_ONLY_NOTE,
+    }

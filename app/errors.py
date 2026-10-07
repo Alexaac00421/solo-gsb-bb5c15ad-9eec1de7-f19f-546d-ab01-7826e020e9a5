@@ -33,3 +33,7 @@ ERR_CLAIM_ALREADY_ACCEPTED = ("CLAIM_ALREADY_ACCEPTED", 409)  # 同订单同类�
 # 理赔待办快照（跨订单）
 ERR_CURSOR_INVALID = ("CURSOR_INVALID", 422)      # 游标格式错误/指向不存在快照/页码越界
 ERR_CURSOR_EXPIRED = ("CURSOR_EXPIRED", 410)      # 游标自快照创建起 30 分钟过期
+
+# 已受理理赔复核（只读）
+ERR_REVIEW_TIME_BEFORE_RECEIVED = ("REVIEW_TIME_BEFORE_RECEIVED", 422)  # 核对时刻早于凭证接收时刻
+ERR_REVIEW_TIME_IN_FUTURE = ("REVIEW_TIME_IN_FUTURE", 422)              # 核对时刻晚于服务当前时刻

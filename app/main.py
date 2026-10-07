@@ -16,7 +16,8 @@ from .services import (archive_determination, create_order,
                        create_todo_snapshot, determination_history,
                        diagnose_calendar, get_todo_snapshot_page, get_voucher,
                        ingest_events, list_events, list_vouchers,
-                       live_determination, preview_events, submit_claim)
+                       live_determination, preview_events,
+                       review_accepted_claim, submit_claim)
 
 
 @asynccontextmanager
@@ -27,10 +28,11 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="快递理赔时限判定服务",
-    version="1.3.0",
+    version="1.4.0",
     description="按订单创建时生效政策版本判定理赔申请时限；支持时区/节假日、事件去重、"
-                "迟到更正与幂等理赔申请凭证；提供只读的节假日表工作日诊断，"
-                "以及面向运营的跨订单理赔待办快照（游标翻页、30 分钟过期）。",
+                "迟到更正与幂等理赔申请凭证；提供只读的节假日表工作日诊断、"
+                "面向运营的跨订单理赔待办快照（游标翻页、30 分钟过期），"
+                "以及已受理理赔的只读资格复核（受理冻结/时间推移基线/现时重算三分对照）。",
     lifespan=lifespan,
 )
 
@@ -179,6 +181,21 @@ def api_list_claims(order_id: str):
 def api_get_claim(claim_no: str):
     """按申请编号查询凭证及其所依据的判定代号与冻结判定。"""
     return get_voucher(claim_no)
+
+
+@app.get("/api/v1/claims/{claim_no}/review")
+def api_review_claim(claim_no: str, as_of: str | None = None):
+    """已受理理赔资格复核（只读）：按凭证编号与带时区偏移的核对时刻查询资格变化。
+
+    返回三份判定（均使用订单锁定的政策、时区与日历）：
+    - 凭证冻结的受理时判定（取不可变凭证快照，不重算）；
+    - 仅推进判定时刻、不纳入受理后到达事件的基线判定（隔离时间推移效应）；
+    - 纳入截至核对时刻到达的扫描与更正后的现时重算判定（归档快照不替代重算）。
+    并分别标出时间推移与后到事件是否改变该类型状态或截止时刻，列出纳入现时
+    重算的后到事件编号及更正动作，自然过期不归因于更正。核对时刻早于凭证接收
+    时刻、晚于服务当前时刻、缺少时区偏移或凭证不存在时明确拒绝。全程只读。
+    """
+    return review_accepted_claim(claim_no, as_of)
 
 
 # ------------------------------------------------------------ 理赔待办快照（跨订单）

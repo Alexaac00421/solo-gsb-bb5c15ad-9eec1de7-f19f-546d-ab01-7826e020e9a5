@@ -15,7 +15,10 @@
    同类型重复受理/非 filable 拒绝/凭证查询）；
 9. 节假日表工作日诊断：只读逐日列出工作/休息判定与截止时刻（含非法参数拒绝）；
 10. 跨订单理赔待办快照：首请求按核对时刻冻结完整结果并分页返回，
-    游标翻页（30 分钟过期），含非法参数/无效游标拒绝示例。
+    游标翻页（30 分钟过期），含非法参数/无效游标拒绝示例；
+11. 已受理理赔资格复核（只读）：按凭证编号 + 带偏移核对时刻返回受理冻结判定、
+    仅推进时间的基线判定与纳入后到扫描/更正的现时重算，分别标出时间推移与
+    后到事件是否改变状态或截止时刻（自然过期不归因更正），含拒绝示例。
 """
 import json
 import os
@@ -147,6 +150,7 @@ def main():
     claim_demo()
     calendar_diagnose_demo()
     todo_snapshot_demo()
+    claim_review_demo()
 
     print("\n示例完成。交互文档：" + BASE + "/docs")
 
@@ -317,6 +321,100 @@ def claim_demo():
     lst = call("GET", f"/api/v1/orders/{oid}/claims")
     if lst:
         print(f"  订单 {oid} 已有凭证 {len(lst['vouchers'])} 张（同类型至多一张）")
+
+
+def claim_review_demo():
+    """已受理理赔资格复核（只读）：独立订单，演示三份判定与两类归因。"""
+    oid = "DEMO-REVIEW-20250205-001"
+    print("\n\n########## 已受理理赔资格复核（只读）演示 ##########")
+    r = call("POST", "/api/v1/orders", {
+        "order_id": oid,
+        "created_at": "2025-02-05T09:00:00+08:00",
+        "timezone": "Asia/Shanghai",
+        "calendar_code": "CN",
+        "promise_by": "2025-02-10T18:00:00+08:00",
+        "weight_kg": 2.5,
+    })
+    if r is None:
+        print("复核演示订单创建失败（可能已存在于持久化数据中），跳过本段演示；"
+              "重跑可换新 ORDER_ID")
+        return
+    call("POST", f"/api/v1/orders/{oid}/events", {
+        "event_id": "EV-RV-SIGNED",
+        "event_type": "signed",
+        "event_time": "2025-02-11T10:00:00+08:00",    # 晚于承诺时限 -> delay 成立
+        "arrived_at": "2025-02-11T10:05:00+08:00",
+    })
+    v = call("POST", f"/api/v1/orders/{oid}/claims", {
+        "claim_type": "delay",
+        "idempotency_key": "IDEMP-REVIEW-001",
+        "received_at": "2025-02-20T12:00:00+08:00",    # 截止 2/25，受理时 filable
+    })
+    if not v:
+        return
+    claim_no = v["claim_no"]
+
+    # 受理后归档第 1 代，再由迟到更正开启第 2 代（签收修正到承诺时限前）
+    call("POST", f"/api/v1/orders/{oid}/determination/archive",
+         params={"as_of": "2025-02-21T12:00:00+08:00"})
+    call("POST", f"/api/v1/orders/{oid}/events", {
+        "event_id": "EV-RV-CORR",
+        "event_type": "signed",
+        "event_time": "2025-02-09T09:00:00+08:00",
+        "arrived_at": "2025-02-22T08:00:00+08:00",      # 受理后到达
+        "correction_action": "amend",
+        "target_event_id": "EV-RV-SIGNED",
+    })
+
+    def show_review(as_of, title):
+        b = call("GET", f"/api/v1/claims/{claim_no}/review", params={"as_of": as_of})
+        if not b:
+            return
+        print(f"\n--- {title}（核对时刻 {as_of}）---")
+        for key, name in (("accepted_at_review", "受理冻结"),
+                          ("baseline_at_review", "基线(仅推进时间)"),
+                          ("current_at_review", "现时(含后到事件)")):
+            view = b[key]
+            print(f"  {name:16s} status={view['status']:15s} "
+                  f"截止={view['deadline_local']} 重算={view['recomputed']} "
+                  f"事件视图截止(UTC)={view['event_view']['arrived_no_later_than_utc']} "
+                  f"第{view['event_view']['generation_no']}代")
+        tp, la = b["time_passage"], b["late_arrivals"]
+        print(f"  时间推移：{tp['status_before']} -> {tp['status_after']}，"
+              f"状态改变={tp['status_changed']}，截止改变={tp['deadline_changed']}，"
+              f"自然过期={tp['natural_expiry']}，归因更正={tp['attributed_to_correction']}")
+        print(f"    └ {tp['attribution']}")
+        print(f"  后到事件：{la['status_before']} -> {la['status_after']}，"
+              f"状态改变={la['status_changed']}，截止改变={la['deadline_changed']}，"
+              f"纳入事件={la['included_late_event_ids']}，"
+              f"更正={la['included_late_correction_ids']}")
+        print(f"    └ {la['attribution']}")
+        for ev in b["late_events"]:
+            print(f"    · {ev['event_id']} {ev['event_type']} "
+                  f"{ev['action']}（{ev['action_label']}）"
+                  + (f" 目标 {ev['target_event_id']}" if ev["target_event_id"] else ""))
+        print(f"  只读：{b['note']}")
+
+    # 1) 截止前核对：时间推移无影响；后到 amend 把现时 delay 改为 not_applicable
+    show_review("2025-02-24T12:00:00+08:00",
+                "复核一：受理后更正到达，现时重算不采用归档快照")
+
+    # 2) 截止后核对：基线因时间推移自然过期（不归因更正），
+    #    现时又被后到 amend 改为 not_applicable——自然过期与更正效应分开标注
+    show_review("2025-02-26T08:00:00+08:00",
+                "复核二：超过截止时刻，自然过期不归因于更正")
+
+    # 非法参数示例（均不改变任何数据）
+    print("\n--- 拒绝示例 ---")
+    call("GET", f"/api/v1/claims/{claim_no}/review")                                  # 缺 as_of
+    call("GET", f"/api/v1/claims/{claim_no}/review",
+         params={"as_of": "2025-02-24T12:00:00"})                                     # 缺时区偏移
+    call("GET", f"/api/v1/claims/{claim_no}/review",
+         params={"as_of": "2025-02-19T12:00:00+08:00"})                               # 早于接收时刻
+    call("GET", f"/api/v1/claims/{claim_no}/review",
+         params={"as_of": "2030-01-01T00:00:00+08:00"})                               # 晚于服务当前时刻
+    call("GET", "/api/v1/claims/CLM-NOT-EXIST/review",
+         params={"as_of": "2025-02-24T12:00:00+08:00"})                               # 凭证不存在
 
 
 if __name__ == "__main__":

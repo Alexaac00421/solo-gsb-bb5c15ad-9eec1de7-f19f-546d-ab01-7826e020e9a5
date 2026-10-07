@@ -9,6 +9,7 @@
 - **理赔申请受理**：按服务实际接收时间实时核验并出具不可变申请凭证（幂等受理、同类型唯一、可查询）。
 - **节假日表工作日诊断**：提交日历/时区/带偏移起始时刻/工作日数/截止钟点，只读逐日解释第 N 个工作日如何得出（含放假跳过、周末补班计入），返回当地与 UTC 截止时刻。
 - **跨订单理赔待办快照**：按带偏移的核对时刻冻结全量待办（重算三类资格、含已有凭证与能否再次申请），游标分页且翻页期间结果不变，游标 30 分钟过期。
+- **已受理理赔资格复核（只读）**：按凭证编号与带偏移核对时刻，返回凭证冻结的受理时判定、仅推进时间不纳入受理后事件的基线判定、纳入截至核对时刻到达的扫描与更正后的现时重算；分别标出时间推移与后到事件是否改变该类型状态或截止时刻，自然过期不归因更正。
 
 ## 判定规则
 
@@ -206,6 +207,82 @@ curl -s "http://localhost:8000/api/v1/claim-todos?cursor=TS-20250220040000-9F2A1
 
 > 说明：快照行只插入不修改（新表 `todo_snapshots`，建表语句带 `IF NOT EXISTS`，老数据目录重启即自动升级）；过期快照仅拒绝访问，不影响既有数据。
 
+### 已受理理赔资格复核（只读，本轮新增）
+
+运营对**已受理**凭证做事后复核：`GET /api/v1/claims/{claim_no}/review?as_of=...`，以带时区偏移的核对时刻重查该类型资格的变化来源。查询**全程只读**，不改变凭证、事件、判定代、归档快照或既有受理规则（响应带 `read_only: true`）。
+
+三份判定**使用同一订单锁定的政策版本、订单时区与节假日表**，且基线/现时均为实时重算——**归档快照不替代重算**（即便受理后已归档并开新代，也按对应事件视图现算）：
+
+| 判定 | 事件视图 | 判定时刻 | 用途 |
+|---|---|---|---|
+| `accepted_at_review` 受理时判定 | 不晚于凭证**接收时刻**到达的事件 | 凭证接收时刻 | 直接取凭证冻结的不可变快照（`recomputed=false`），永不改变 |
+| `baseline_at_review` 基线判定 | 同上（**受理后到达的事件一律不纳入**） | 核对时刻 | 仅推进时间，隔离**时间推移**的单独效应 |
+| `current_at_review` 现时判定 | 不晚于**核对时刻**到达的全部扫描与更正 | 核对时刻 | 隔离**后到事件**在时间推移之上的追加效应 |
+
+归因分两段独立给出，且每段同时报告该类型状态与截止时刻（当地+UTC）的前后值：
+
+- `time_passage`（受理冻结 → 基线）：只由时间推移引起。若 `filable → not_filable` 且截止时刻未变，标 `natural_expiry=true`、`attributed_to_correction=false`，说明文字明确**自然过期与受理后事件/更正无关**；
+- `late_arrivals`（基线 → 现时，同一核对时刻）：只由受理后到达事件引起。`included_late_event_ids` 列出全部纳入现时重算的后到事件，`included_late_correction_ids` 单列更正；`late_events` 逐条给出编号、类型、是否更正、`correction_action`（`amend` 修正目标时间 / `cancel` 撤销目标 / `insert` 补录扫描；普通扫描记为 `scan`）、目标事件与说明。基线已自然过期时 `baseline_already_expired=true`，即使后到更正另引起状态变化，也明确**自然过期部分不归因于更正**。
+
+```bash
+curl -s "http://localhost:8000/api/v1/claims/CLM-20250220120000-9F2A1C77/review?as_of=2025-02-26T08:00:00%2B08:00"
+```
+
+响应节选（2/20 受理 delay、2/21 归档、2/22 一条 amend 把签收修正到承诺时限前；2/26 复核）：
+
+```json
+{
+  "claim_no": "CLM-20250220120000-9F2A1C77",
+  "order_id": "O-1001", "claim_type": "delay", "policy_version": "v2",
+  "timezone": "Asia/Shanghai", "calendar_code": "CN",
+  "received_at_utc": "2025-02-20T04:00:00+00:00",
+  "review_at_utc": "2025-02-26T00:00:00+00:00",
+  "accepted_at_review": {"source": "voucher_frozen_snapshot", "recomputed": false,
+                         "status": "filable", "deadline_local": "2025-02-25T23:59:59+08:00",
+                         "event_view": {"arrived_no_later_than_utc": "2025-02-20T04:00:00+00:00",
+                                        "event_count": 1, "generation_no": 1},
+                         "claim": {"...凭证冻结的该类型判定..."},
+                         "determination": {"...凭证冻结的整单判定..."}},
+  "baseline_at_review": {"recomputed": true, "status": "not_filable",
+                         "deadline_local": "2025-02-25T23:59:59+08:00",
+                         "event_view": {"arrived_no_later_than_utc": "2025-02-20T04:00:00+00:00",
+                                        "event_count": 1, "generation_no": 1}},
+  "current_at_review": {"recomputed": true, "status": "not_applicable",
+                        "deadline_local": null,
+                        "event_view": {"arrived_no_later_than_utc": "2025-02-26T00:00:00+00:00",
+                                       "event_count": 2, "generation_no": 2}},
+  "time_passage": {"status_before": "filable", "status_after": "not_filable",
+                   "status_changed": true, "deadline_changed": false,
+                   "natural_expiry": true, "attributed_to_correction": false,
+                   "attribution": "仅时间推移即改变该类型状态：filable → not_filable；截止时刻 ... 自然到期，属自然过期，与受理后到达事件及更正无关"},
+  "late_arrivals": {"status_before": "not_filable", "status_after": "not_applicable",
+                    "deadline_changed": true, "baseline_already_expired": true,
+                    "driven_by_late_events": true, "attributed_to_correction": true,
+                    "included_late_event_ids": ["EV-CORR-1"],
+                    "included_late_correction_ids": ["EV-CORR-1"],
+                    "late_events_count": 1, "late_corrections_count": 1, "late_scans_count": 0,
+                    "attribution": "基线已自然过期；后到事件另引起状态或截止时刻变化...，自然过期部分仍不归因于更正"},
+  "late_events": [{"event_id": "EV-CORR-1", "event_type": "signed",
+                   "is_correction": true, "correction_action": "amend", "action": "amend",
+                   "action_label": "更正动作 amend：修正目标基础事件的发生时间",
+                   "target_event_id": "EV-1", "arrived_at_utc": "2025-02-22T00:00:00+00:00",
+                   "generation_no": 2}],
+  "read_only": true,
+  "note": "只读复核：未修改凭证、事件、判定代、归档快照或既有受理规则；..."
+}
+```
+
+明确拒绝（均为统一错误体）：
+
+| 情形 | 状态码 | 错误码 |
+|---|---|---|
+| `as_of` 缺失 / 无时区偏移（naive）/ 不可解析 | 422 | `INVALID_REQUEST` |
+| 核对时刻早于凭证接收时刻 | 422 | `REVIEW_TIME_BEFORE_RECEIVED` |
+| 核对时刻晚于服务当前时刻 | 422 | `REVIEW_TIME_IN_FUTURE` |
+| 凭证不存在 | 404 | `VOUCHER_NOT_FOUND` |
+
+> 边界：核对时刻恰等于凭证接收时刻允许（半开口径，受理时到达的事件本就属于凭证依据）；核对时刻之后才到达的事件不纳入现时重算。
+
 ## 目录结构
 
 ```
@@ -220,8 +297,8 @@ app/
   services.py      # 订单、事件摄取、归档/开代、判定装配、理赔申请受理/查询、日历诊断
   main.py          # FastAPI 路由
 init_db.py         # 初始化入口（建表 + 种子，幂等）
-examples/call_api.py  # 端到端调用示例（仅标准库，含理赔申请与日历诊断全链路）
-tests/             # pytest 引擎单测 + API 端到端测试（99 个用例）
+examples/call_api.py  # 端到端调用示例（仅标准库，含理赔申请、日历诊断、待办快照与受理复核全链路）
+tests/             # pytest 引擎单测 + API 端到端测试（119 个用例）
 Dockerfile, docker-compose.yml
 ```
 
@@ -285,6 +362,7 @@ pytest -q
 | POST | `/api/v1/orders/{id}/claims` | **提交理赔申请**：按接收时间实时核验，filable 则出不可变凭证（幂等） |
 | GET | `/api/v1/orders/{id}/claims` | 该订单全部已受理凭证 |
 | GET | `/api/v1/claims/{claim_no}` | 按申请编号查凭证及其判定代号/冻结依据 |
+| GET | `/api/v1/claims/{claim_no}/review?as_of=...` | **已受理理赔资格复核（只读）**：受理冻结/仅推进时间基线/现时重算三分对照，分别归因时间推移与后到事件（含更正动作） |
 | POST | `/api/v1/claim-todos` | **理赔待办快照首请求**：按核对时刻冻结全量待办，返回第 1 页与下一游标 |
 | GET | `/api/v1/claim-todos?cursor=...` | **游标翻页**：结果固定不变；游标 30 分钟过期 |
 | GET | `/api/v1/policies` | 政策版本列表 |
@@ -490,6 +568,14 @@ curl -s -X POST http://localhost:8000/api/v1/orders/O-1001/claims \
 - **新增政策版本**：向 `policies` 表插入一行 JSON（时限天数、工作日/自然日、截止钟点均可配），无需发版；新增节假日在 `calendars` 表 upsert。
 - **新增理赔类型/扫描事件**：在 `constants.py` 登记标签、政策 JSON 增规则、`engine.py` 增加一个 resolver，接口与代际机制无需改动。
 - 截止钟点默认 23:59:59，可被政策窗口级 `cutoff` 或环境变量 `CLAIM_DEFAULT_CUTOFF` 覆盖。
+
+### v1.4.0 变动（已受理理赔资格复核）
+
+- 新增只读接口 `GET /api/v1/claims/{claim_no}/review?as_of=...`：按凭证编号与带时区偏移的核对时刻返回三份判定——凭证冻结的受理时判定（取不可变凭证快照、不重算）、仅推进判定时刻而不纳入受理后到达事件的基线判定、纳入截至核对时刻到达的全部扫描与更正后的现时判定。
+- 三份判定均使用订单锁定的政策版本、订单时区与节假日表；基线/现时一律实时重算，归档快照不替代重算（受理后归档开新代时，现时按新代事件视图现算）。
+- `time_passage` 与 `late_arrivals` 分别标出时间推移、后到事件是否改变**该类型状态或截止时刻**（含前后值）；仅时间推移导致的 `filable → not_filable` 标 `natural_expiry`，自然过期绝不归因于更正；`late_events` 逐条列出纳入现时重算的后到事件编号与更正动作（amend/cancel/insert，普通扫描标 scan），基线已过期时也把自然过期与更正效应分开标注。
+- 核对时刻缺失/无时区偏移/不可解析 422 `INVALID_REQUEST`，早于凭证接收时刻 422 `REVIEW_TIME_BEFORE_RECEIVED`，晚于服务当前时刻 422 `REVIEW_TIME_IN_FUTURE`，凭证不存在 404 `VOUCHER_NOT_FOUND`。
+- 全程 GET 只读：不新增表、不写凭证/事件/代/归档、不改变既有受理规则；既有接口、启动方式（`docker compose up --build` 自动初始化）与统一错误体约定**完全保持不变**；测试由 99 个增至 119 个。
 
 ### v1.3.0 变动（跨订单理赔待办快照）
 
